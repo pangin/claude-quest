@@ -303,44 +303,96 @@ func (w *Watcher) tailFile() {
 			}
 
 			w.lastPos = info.Size()
+			// Refresh lastModTime so checkForNewerFile compares against the
+			// CURRENT file's freshest mtime — otherwise an externally-touched
+			// stale session file with mtime > our startup snapshot would always
+			// "win" the comparison and trigger a spurious switch.
+			w.lastModTime = info.ModTime()
 		}
 
 		file.Close()
 	}
 }
 
-// checkForNewerFile checks if a newer conversation file exists and switches to it
+// activeSessionWindow is how recently a candidate file must have been modified
+// to be considered a live session worth switching to. Claude Code occasionally
+// touches old session files for bookkeeping (mtime bump without growth);
+// requiring a recent mtime guards against switching to those stale files.
+const activeSessionWindow = 30 * time.Second
+
+// checkForNewerFile decides whether a different JSONL file under the project
+// directory has become the active session and, if so, switches to it. The
+// switch is intentionally conservative:
+//
+//  1. The candidate must have a strictly newer mtime than a FRESH stat of the
+//     current file (not the cached lastModTime, which may be stale between
+//     ticks).
+//  2. The candidate must look like a live session — UUID-shaped filename and
+//     mtime within activeSessionWindow of now.
+//
+// On switch, we seek to the END of the new file so we do NOT replay its
+// historical content as live events. (Without this, a 33MB-9k-event file
+// would dump all its prior events into the channel, inflating XP and showing
+// the user a flood of "same context replaying".)
 func (w *Watcher) checkForNewerFile() bool {
 	if w.ProjectDir == "" {
 		return false
 	}
 
 	filePath, modTime, err := w.findNewestConversation()
+	if err != nil || filePath == w.FilePath {
+		return false
+	}
+
+	// Compare against the CURRENT file's freshest mtime, not the stale
+	// w.lastModTime. If the active file is still being written, it is its
+	// own newest reference and we never switch away from it.
+	if curInfo, statErr := os.Stat(w.FilePath); statErr == nil {
+		if !modTime.After(curInfo.ModTime()) {
+			return false
+		}
+	} else if !modTime.After(w.lastModTime) {
+		// Current file vanished — fall back to the cached baseline.
+		return false
+	}
+
+	// Filter out spurious touches of historical sessions.
+	if !looksLikeActiveSession(filePath, modTime) {
+		return false
+	}
+
+	newInfo, err := os.Stat(filePath)
 	if err != nil {
 		return false
 	}
 
-	// If we found a different file that's newer, switch to it
-	if filePath != w.FilePath && modTime.After(w.lastModTime) {
-		oldFile := filepath.Base(w.FilePath)
-		newFile := filepath.Base(filePath)
+	oldFile := filepath.Base(w.FilePath)
+	newFile := filepath.Base(filePath)
 
-		w.FilePath = filePath
-		w.lastModTime = modTime
-		w.lastPos = 0 // Start from beginning of new file
+	w.FilePath = filePath
+	w.lastModTime = modTime
+	w.lastPos = newInfo.Size() // Seek to EOF — only emit events appended from now on.
 
-		// Notify about the switch
-		w.Events <- Event{
-			Type:    EventSystemInit,
-			Details: fmt.Sprintf("Switched: %s", newFile),
-		}
-
-		// Log the switch
-		fmt.Printf("Switched from %s to %s\n", oldFile, newFile)
-		return true
+	w.Events <- Event{
+		Type:    EventSystemInit,
+		Details: fmt.Sprintf("Switched: %s", newFile),
 	}
 
-	return false
+	fmt.Printf("Switched from %s to %s\n", oldFile, newFile)
+	return true
+}
+
+// looksLikeActiveSession reports whether a candidate file path appears to be a
+// live Claude Code session worth switching to. The filename must be UUID-shaped
+// (36 chars before .jsonl) and the supplied mtime must be within the active
+// window of "now", so that historical session files whose mtimes were merely
+// touched by Claude Code's bookkeeping are not eligible.
+func looksLikeActiveSession(path string, modTime time.Time) bool {
+	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	if len(base) != 36 {
+		return false
+	}
+	return time.Since(modTime) <= activeSessionWindow
 }
 
 // StartReplay plays through an existing conversation file
