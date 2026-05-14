@@ -142,6 +142,7 @@ type Watcher struct {
 	ReplaySpeed time.Duration // Delay between events in replay mode
 	lastPos     int64         // Last read position for tailing
 	lastModTime time.Time     // Last modification time of current file
+	seenUUIDs   *uuidSet      // Bounded set of UUIDs already emitted, to drop replays
 
 	// State tracking
 	LastTokenUsage   *TokenUsage
@@ -155,6 +156,7 @@ func NewWatcher() *Watcher {
 		Events:           make(chan Event, 100),
 		ReplaySpeed:      200 * time.Millisecond, // Default replay speed
 		ActiveTaskAgents: make(map[string]string),
+		seenUUIDs:        newUUIDSet(50000),
 	}
 }
 
@@ -434,6 +436,25 @@ func (w *Watcher) StartReplay(filePath string) error {
 
 // parseLine parses a JSON line and returns events if applicable
 func (w *Watcher) parseLine(line string) []Event {
+	// Probe for an identity field first so we can drop duplicates without
+	// paying the full Unmarshal cost on lines we've already processed. Both
+	// "uuid" (regular messages) and "messageId" (file-history-snapshot rows)
+	// appear at the top level in Claude Code's JSONL.
+	var idProbe struct {
+		UUID      string `json:"uuid"`
+		MessageID string `json:"messageId"`
+	}
+	dedupKey := ""
+	if err := json.Unmarshal([]byte(line), &idProbe); err == nil {
+		dedupKey = idProbe.UUID
+		if dedupKey == "" {
+			dedupKey = idProbe.MessageID
+		}
+		if dedupKey != "" && w.seenUUIDs != nil && !w.seenUUIDs.add(dedupKey) {
+			return nil
+		}
+	}
+
 	var msg ClaudeMessage
 	if err := json.Unmarshal([]byte(line), &msg); err != nil {
 		return nil
@@ -461,6 +482,22 @@ func (w *Watcher) parseLine(line string) []Event {
 				Type:    EventIdle,
 				Details: truncate(msg.Summary, 50),
 			})
+		}
+	}
+
+	// Compact boundary marks a natural reset point: pre-compact UUIDs are no
+	// longer referenced by anything we'll process. Drop them so memory comes
+	// back early. The current line's own UUID is re-added so a hypothetical
+	// re-read of this exact line does not re-emit the compact event.
+	if w.seenUUIDs != nil {
+		for _, evt := range events {
+			if evt.Type == EventCompact {
+				w.seenUUIDs.reset()
+				if dedupKey != "" {
+					w.seenUUIDs.add(dedupKey)
+				}
+				break
+			}
 		}
 	}
 
@@ -824,6 +861,59 @@ func encodeProjectPath(absPath string) string {
 	encoded = strings.ReplaceAll(encoded, ".", "-")
 	encoded = strings.ReplaceAll(encoded, " ", "-")
 	return encoded
+}
+
+// uuidSet is a bounded set of UUIDs used by the watcher to drop events that
+// have already been emitted. Bounded means the oldest entries are evicted in
+// insertion order once capacity is reached — a ring buffer plus a map for O(1)
+// membership checks. 50k entries (≈5 MB) is more than enough headroom: a busy
+// JSONL holds a few thousand UUIDs, and we never need older history than a few
+// recent files.
+type uuidSet struct {
+	cap   int
+	order []string
+	head  int
+	full  bool
+	idx   map[string]struct{}
+}
+
+func newUUIDSet(capacity int) *uuidSet {
+	if capacity <= 0 {
+		capacity = 1
+	}
+	return &uuidSet{
+		cap:   capacity,
+		order: make([]string, capacity),
+		idx:   make(map[string]struct{}, capacity),
+	}
+}
+
+// add records uuid in the set. Returns true if uuid was newly added (i.e. not
+// previously seen), false if it was already present.
+func (s *uuidSet) add(uuid string) bool {
+	if _, ok := s.idx[uuid]; ok {
+		return false
+	}
+	if s.full {
+		delete(s.idx, s.order[s.head])
+	}
+	s.order[s.head] = uuid
+	s.idx[uuid] = struct{}{}
+	s.head++
+	if s.head == s.cap {
+		s.head = 0
+		s.full = true
+	}
+	return true
+}
+
+// reset clears all remembered UUIDs. Used at conversation boundaries such as
+// compact, where pre-boundary message UUIDs are no longer interesting and
+// memory can be freed back early.
+func (s *uuidSet) reset() {
+	s.idx = make(map[string]struct{}, s.cap)
+	s.head = 0
+	s.full = false
 }
 
 func truncate(s string, maxLen int) string {

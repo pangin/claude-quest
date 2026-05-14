@@ -114,6 +114,98 @@ func TestCheckForNewerFile_NonUUIDFilenameIgnored(t *testing.T) {
 	}
 }
 
+func TestUUIDSet_AddIsDedup(t *testing.T) {
+	s := newUUIDSet(16)
+	if !s.add("a") {
+		t.Fatalf("first add of 'a' should return true (newly added)")
+	}
+	if s.add("a") {
+		t.Fatalf("second add of 'a' should return false (already present)")
+	}
+	if !s.add("b") {
+		t.Fatalf("first add of 'b' should return true")
+	}
+}
+
+func TestUUIDSet_EvictsOldestAtCapacity(t *testing.T) {
+	const cap = 4
+	s := newUUIDSet(cap)
+	for i := 0; i < cap; i++ {
+		if !s.add(fmt.Sprintf("u%d", i)) {
+			t.Fatalf("fresh add returned false at i=%d", i)
+		}
+	}
+	// All cap distinct keys present — re-adding "u0" should still be a dup.
+	if s.add("u0") {
+		t.Fatalf("u0 should still be present before any evictions")
+	}
+	// Adding a new key forces eviction of the oldest ("u0").
+	if !s.add("u4") {
+		t.Fatalf("u4 should be a fresh add")
+	}
+	// Now "u0" must be evictable — re-adding returns true.
+	if !s.add("u0") {
+		t.Fatalf("u0 should have been evicted and now count as newly added")
+	}
+}
+
+func TestUUIDSet_ResetClearsAll(t *testing.T) {
+	s := newUUIDSet(8)
+	for i := 0; i < 5; i++ {
+		s.add(fmt.Sprintf("u%d", i))
+	}
+	s.reset()
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("u%d", i)
+		if !s.add(key) {
+			t.Fatalf("after reset, %q should be a fresh add", key)
+		}
+	}
+}
+
+func TestParseLine_DedupesByUUID(t *testing.T) {
+	w := NewWatcher()
+	line := `{"type":"assistant","uuid":"abc-123","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}`
+
+	first := w.parseLine(line)
+	if len(first) == 0 {
+		t.Fatalf("first parseLine should emit at least one event")
+	}
+	second := w.parseLine(line)
+	if len(second) != 0 {
+		t.Fatalf("second parseLine should be deduped to zero events, got %d", len(second))
+	}
+}
+
+func TestParseLine_CompactResetsDedupSet(t *testing.T) {
+	// After a compact boundary, pre-compact UUIDs are no longer referenced
+	// by anything we'll process. The dedup set should reset so memory is
+	// freed early, while still preserving the compact line's own UUID so
+	// re-reading that exact line cannot re-emit the compact event.
+	w := NewWatcher()
+
+	pre := `{"type":"assistant","uuid":"pre-1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}`
+	compact := `{"type":"system","subtype":"compact_boundary","uuid":"compact-1","compactMetadata":{"trigger":"auto","preTokens":120000}}`
+
+	if got := w.parseLine(pre); len(got) == 0 {
+		t.Fatalf("expected pre-compact event")
+	}
+	if got := w.parseLine(compact); len(got) == 0 || got[0].Type != EventCompact {
+		t.Fatalf("expected compact event")
+	}
+
+	// Pre-compact UUID should now count as fresh again — reset cleared it.
+	if got := w.parseLine(pre); len(got) == 0 {
+		t.Fatalf("pre-compact UUID should be acceptable after compact reset, got nothing")
+	}
+
+	// But the compact line itself was re-added after reset, so re-reading
+	// the compact line is still deduped.
+	if got := w.parseLine(compact); len(got) != 0 {
+		t.Fatalf("compact line should remain deduped after reset, got %d events", len(got))
+	}
+}
+
 func TestCheckForNewerFile_RealSessionSwitchSeeksToEOF(t *testing.T) {
 	dir := t.TempDir()
 
